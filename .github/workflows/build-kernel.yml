@@ -73,6 +73,27 @@ jobs:
           chmod +x "$GITHUB_WORKSPACE/tc/bin/"*
           "${CROSS_COMPILE}gcc" --version || { echo "::error::gcc 无法执行"; exit 1; }
 
+      - name: 放宽 GCC 版本下限（4.9 内核原生配 GCC 4.9）
+        working-directory: kernel
+        run: |
+          set -e
+          # Reno 树(4.9.337) 的 compiler-gcc.h 是从新内核 backport 的，
+          # 硬卡 GCC >= 5.1，但该检查对 __clang__ 豁免：
+          #   #elif defined(CONFIG_ARM64) && GCC_VERSION < 50100 && !defined(__clang__)
+          #       # error Sorry, your version of GCC is too old - please use 5.1 or newer.
+          # 而 Linux 4.9 的原生编译器正是 aarch64-linux-android-4.9
+          # （AOSP 全部 4.9 内核都用它构建），故注释掉这一行即可。
+          H=include/linux/compiler-gcc.h
+          if grep -q "please use 5.1 or newer" "$H"; then
+            cp "$H" "$H.bak"
+            sed -i '/please use 5.1 or newer/d' "$H"
+            echo "[+] 已移除 GCC 5.1 硬门槛"
+          else
+            echo "[=] 无需处理"
+          fi
+          echo "--- 修改后相关区段:"
+          grep -n -A2 -B2 "too old" "$H" || true
+
       - name: 移除 GCC 4.9 不认识的编译选项
         working-directory: kernel
         run: |
