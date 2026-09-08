@@ -18,6 +18,12 @@ jobs:
     timeout-minutes: 300
 
     steps:
+      - name: 检出本仓库（配置 + 脚本）
+        uses: actions/checkout@v4
+        with:
+          path: self
+          fetch-depth: 1
+
       - name: 检出内核源码 (Reno / OP46B1)
         uses: actions/checkout@v4
         with:
@@ -29,9 +35,11 @@ jobs:
       - name: 放入 defconfig
         run: |
           set -e
-          cp ci/sdm670_reno_ksu_defconfig kernel/arch/arm64/configs/
+          echo "=== 本仓库内容 ==="
+          ls -la self/
+          ls -la self/ci/ || { echo "::error::self/ci 不存在，检查分支是否正确"; exit 1; }
+          cp self/ci/sdm670_reno_ksu_defconfig kernel/arch/arm64/configs/
           cd kernel
-          # Reno 树配置在 arch/arm64/configs/ 下
           ls arch/arm64/configs/ | grep -i sdm670
           cp arch/arm64/configs/sdm670_reno_ksu_defconfig .config
 
@@ -125,7 +133,7 @@ jobs:
 
       - name: "[KSU] 注入 hook"
         if: inputs.mode == 'ksunext'
-        run: python3 ci/scripts/inject_hooks.py kernel
+        run: python3 self/ci/scripts/inject_hooks.py kernel
 
       # ================= 编译 =================
       - name: 编译内核
