@@ -1,0 +1,167 @@
+name: Build R17 Kernel (Reno tree)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '编译模式（先跑 stock 验证开机）'
+        required: true
+        default: 'stock'
+        type: choice
+        options:
+          - stock
+          - ksunext
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+
+    steps:
+      - name: 检出内核源码 (Reno / OP46B1)
+        uses: actions/checkout@v4
+        with:
+          repository: OP46B1-Dev/android_kernel_oppo_sdm710
+          ref: lineage-18.1
+          path: kernel
+          fetch-depth: 1
+
+      - name: 放入 defconfig
+        run: |
+          set -e
+          cp ci/sdm670_reno_ksu_defconfig kernel/arch/arm64/configs/
+          cd kernel
+          # Reno 树配置在 arch/arm64/configs/ 下
+          ls arch/arm64/configs/ | grep -i sdm670
+          cp arch/arm64/configs/sdm670_reno_ksu_defconfig .config
+
+      - name: 安装依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            bc bison flex libssl-dev libelf-dev ccache \
+            make gcc device-tree-compiler zip curl \
+            python3 python-is-python3
+
+      - name: 下载 GCC 4.9 工具链
+        run: |
+          set -e
+          rm -rf "$GITHUB_WORKSPACE/tc"
+          if git clone --depth 1 -b lineage-19.1 \
+              https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+              "$GITHUB_WORKSPACE/tc" ; then
+            echo "[OK] LineageOS 镜像"
+          else
+            git clone --depth 1 \
+              https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
+              "$GITHUB_WORKSPACE/tc"
+          fi
+
+      - name: 校验工具链
+        run: |
+          set -e
+          export CROSS_COMPILE=$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-
+          [ -f "${CROSS_COMPILE}gcc" ] || { echo "::error::工具链缺失"; exit 1; }
+          chmod +x "$GITHUB_WORKSPACE/tc/bin/"*
+          "${CROSS_COMPILE}gcc" --version || { echo "::error::gcc 无法执行"; exit 1; }
+
+      - name: 移除 GCC 4.9 不认识的编译选项
+        working-directory: kernel
+        run: |
+          set -e
+          n=$(grep -rl "Wno-enum-conversion" . 2>/dev/null | wc -l)
+          echo "命中: $n"
+          [ "$n" -gt 0 ] && grep -rl "Wno-enum-conversion" . 2>/dev/null \
+            | xargs -r sed -i 's/-Wno-enum-conversion//g' || true
+          echo "[OK]"
+
+      - name: 移除 R17 无此硬件的 NXP 功放
+        working-directory: kernel
+        run: |
+          set -e
+          grep -rni "tfa98" techpack/ --include=Makefile --include=Kbuild || echo "(未引用)"
+          find techpack \( -name 'Makefile' -o -name 'Kbuild' \) \
+            -exec sed -i '/tfa98/Id' {} + 2>/dev/null || true
+          for m in $(find techpack -path '*tfa98xx*' -name 'Makefile'); do
+            : > "$m"; echo "[+] 清空 $m"
+          done
+          grep -rni "tfa98" techpack/ --include=Makefile --include=Kbuild || echo "(已清空)"
+
+      - name: 解析依赖
+        working-directory: kernel
+        run: |
+          set -e
+          export ARCH=arm64 SUBARCH=arm64
+          export CROSS_COMPILE=$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-
+          make olddefconfig
+
+      # ================= 仅 ksunext =================
+      - name: "[KSU] 拉取 Reno 已验证的 4.9 backport"
+        if: inputs.mode == 'ksunext'
+        working-directory: kernel
+        run: |
+          git config user.email ci@example.com
+          git config user.name CI
+          git remote add rksu https://github.com/OP46B1-Dev/android_kernel_oppo_sdm710.git 2>/dev/null || true
+          git fetch --depth 1 origin deprecated/color-11.1_rksu
+          for sha in \
+            ba18867fe84e9e41d13535eee933a9f5e733babf \
+            7e103d9bc84bbb791b65b15ad7c9b62d3023eb0e \
+            782269366a1928466ba8aa4f0bffc88da861d866 \
+            be3865c776a668bc914976b6c5f42fc8b1fe8bd1 \
+            3460c15b1b937b7a8b256c1f2982debc10bf1301 \
+            38baa0988a7aeef2efbfb4ccf6b06dd8d50e0538 \
+            ba688d384ae45185e509d4152c5c86b82b1011bb ; do
+            echo "--- cherry-pick $sha"
+            git cherry-pick --no-commit "$sha" || echo "[!] 冲突 $sha"
+          done
+
+      - name: "[KSU] 安装 KernelSU-Next"
+        if: inputs.mode == 'ksunext'
+        working-directory: kernel
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/legacy/kernel/setup.sh" | bash -s legacy
+          ls drivers/kernelsu || echo "[!] 缺失"
+
+      - name: "[KSU] 注入 hook"
+        if: inputs.mode == 'ksunext'
+        run: python3 ci/scripts/inject_hooks.py kernel
+
+      # ================= 编译 =================
+      - name: 编译内核
+        working-directory: kernel
+        run: |
+          export ARCH=arm64 SUBARCH=arm64
+          export CROSS_COMPILE=$GITHUB_WORKSPACE/tc/bin/aarch64-linux-android-
+          export USE_CCACHE=1 CCACHE_DIR=$GITHUB_WORKSPACE/.ccache
+          ret=0
+          make -k -j$(nproc) > $GITHUB_WORKSPACE/build.log 2>&1 || ret=$?
+          tail -60 $GITHUB_WORKSPACE/build.log
+          echo "===== 错误汇总 ====="
+          grep -nE "fatal error:|error:|Error [0-9]+" $GITHUB_WORKSPACE/build.log \
+            | sort -u | head -40
+          echo "===== make exit=$ret ====="
+          exit $ret
+
+      - name: 收集产物
+        run: |
+          set -e
+          mkdir -p out
+          ok=0
+          for f in kernel/arch/arm64/boot/Image.gz-dtb \
+                   kernel/arch/arm64/boot/Image.gz \
+                   kernel/arch/arm64/boot/Image-dtb \
+                   kernel/arch/arm64/boot/Image ; do
+            [ -f "$f" ] && cp "$f" out/ && echo "[+] $f" && ok=1
+          done
+          cp kernel/.config out/config.txt
+          [ -f build.log ] && cp build.log out/build.log || true
+          ls -la out/
+          [ "$ok" -eq 1 ] || { echo "::error::未生成内核镜像"; exit 1; }
+
+      - name: 上传
+        uses: actions/upload-artifact@v4
+        with:
+          name: r17-reno-${{ inputs.mode }}
+          path: out/
+          retention-days: 30
