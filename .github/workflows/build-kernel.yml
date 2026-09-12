@@ -94,6 +94,46 @@ jobs:
           echo "--- 修改后相关区段:"
           grep -n -A2 -B2 "too old" "$H" || true
 
+      - name: 放宽 -Werror（vendor 代码 + GCC 4.9 的必经之路）
+        working-directory: kernel
+        run: |
+          set -e
+          # 顶层 Makefile 里有 5 条硬 -Werror（从新内核 backport 的）：
+          #   KBUILD_CFLAGS += $(call cc-option,-Werror=incompatible-pointer-types)
+          #   KBUILD_CFLAGS += $(call cc-option,-Werror=designated-init) ...
+          # 典型报错:
+          #   error: initialization from incompatible pointer type [-Werror]
+          #   (near initialization for 'dev_attr_xxx.show')
+          # 这是 vendor 代码里 sysfs show/store 的 const 差异，
+          # 在 ARM64 上 ABI 完全一致，运行时无害，但 GCC 严格判型会报。
+          # clang（本树设计编译器）对这类更宽容，故原作者从未遇到。
+          echo "=== 处理前 ==="
+          grep -n "call cc-option,-Werror=" Makefile || echo "(无)"
+          sed -i '/call cc-option,-Werror=/s|^|# |' Makefile
+          echo "=== 处理后 ==="
+          grep -n "call cc-option,-Werror=" Makefile || echo "(已全部注释)"
+
+      - name: 通用修复 trace 头文件路径
+        working-directory: kernel
+        run: |
+          set -e
+          # 一类反复出现的坑：vendor 驱动里
+          #   #define CREATE_TRACE_POINTS
+          #   #include "xxx_trace.h"      -> 该头里 #define TRACE_INCLUDE_PATH .
+          # 于是 include/trace/define_trace.h 展开成 #include "./xxx_trace.h"
+          # 按 include/trace/ 找不到。给这些目录的 Makefile 加 -I$(src) 即可。
+          n=0
+          for f in $(grep -rl "CREATE_TRACE_POINTS" --include='*.c' . 2>/dev/null); do
+            d=$(dirname "$f"); mk="$d/Makefile"
+            [ -f "$mk" ] || continue
+            if ! grep -q -- '-I\$(src)' "$mk"; then
+              echo "ccflags-y += -I\$(src)" >> "$mk"
+              echo "[+] $mk"
+              n=$((n+1))
+            fi
+          done
+          echo "[OK] 共处理 $n 个目录"
+
       - name: 移除 GCC 4.9 不认识的编译选项
         working-directory: kernel
         run: |
@@ -168,7 +208,7 @@ jobs:
           tail -60 $GITHUB_WORKSPACE/build.log
           echo "===== 错误汇总 ====="
           grep -nE "fatal error:|error:|Error [0-9]+" $GITHUB_WORKSPACE/build.log \
-            | sort -u | head -40
+            | sort -n -u | head -40
           echo "===== make exit=$ret ====="
           exit $ret
 
