@@ -73,88 +73,10 @@ jobs:
           chmod +x "$GITHUB_WORKSPACE/tc/bin/"*
           "${CROSS_COMPILE}gcc" --version || { echo "::error::gcc 无法执行"; exit 1; }
 
-      - name: 放宽 GCC 版本下限（4.9 内核原生配 GCC 4.9）
-        working-directory: kernel
+      - name: 修复 vendor 树在 GCC 4.9 下的编译障碍
         run: |
           set -e
-          # Reno 树(4.9.337) 的 compiler-gcc.h 是从新内核 backport 的，
-          # 硬卡 GCC >= 5.1，但该检查对 __clang__ 豁免：
-          #   #elif defined(CONFIG_ARM64) && GCC_VERSION < 50100 && !defined(__clang__)
-          #       # error Sorry, your version of GCC is too old - please use 5.1 or newer.
-          # 而 Linux 4.9 的原生编译器正是 aarch64-linux-android-4.9
-          # （AOSP 全部 4.9 内核都用它构建），故注释掉这一行即可。
-          H=include/linux/compiler-gcc.h
-          if grep -q "please use 5.1 or newer" "$H"; then
-            cp "$H" "$H.bak"
-            sed -i '/please use 5.1 or newer/d' "$H"
-            echo "[+] 已移除 GCC 5.1 硬门槛"
-          else
-            echo "[=] 无需处理"
-          fi
-          echo "--- 修改后相关区段:"
-          grep -n -A2 -B2 "too old" "$H" || true
-
-      - name: 放宽 -Werror（vendor 代码 + GCC 4.9 的必经之路）
-        working-directory: kernel
-        run: |
-          set -e
-          # 顶层 Makefile 里有 5 条硬 -Werror（从新内核 backport 的）：
-          #   KBUILD_CFLAGS += $(call cc-option,-Werror=incompatible-pointer-types)
-          #   KBUILD_CFLAGS += $(call cc-option,-Werror=designated-init) ...
-          # 典型报错:
-          #   error: initialization from incompatible pointer type [-Werror]
-          #   (near initialization for 'dev_attr_xxx.show')
-          # 这是 vendor 代码里 sysfs show/store 的 const 差异，
-          # 在 ARM64 上 ABI 完全一致，运行时无害，但 GCC 严格判型会报。
-          # clang（本树设计编译器）对这类更宽容，故原作者从未遇到。
-          echo "=== 处理前 ==="
-          grep -n "call cc-option,-Werror=" Makefile || echo "(无)"
-          sed -i '/call cc-option,-Werror=/s|^|# |' Makefile
-          echo "=== 处理后 ==="
-          grep -n "call cc-option,-Werror=" Makefile || echo "(已全部注释)"
-
-      - name: 通用修复 trace 头文件路径
-        working-directory: kernel
-        run: |
-          set -e
-          # 一类反复出现的坑：vendor 驱动里
-          #   #define CREATE_TRACE_POINTS
-          #   #include "xxx_trace.h"      -> 该头里 #define TRACE_INCLUDE_PATH .
-          # 于是 include/trace/define_trace.h 展开成 #include "./xxx_trace.h"
-          # 按 include/trace/ 找不到。给这些目录的 Makefile 加 -I$(src) 即可。
-          n=0
-          for f in $(grep -rl "CREATE_TRACE_POINTS" --include='*.c' . 2>/dev/null); do
-            d=$(dirname "$f"); mk="$d/Makefile"
-            [ -f "$mk" ] || continue
-            if ! grep -q -- '-I\$(src)' "$mk"; then
-              echo "ccflags-y += -I\$(src)" >> "$mk"
-              echo "[+] $mk"
-              n=$((n+1))
-            fi
-          done
-          echo "[OK] 共处理 $n 个目录"
-
-      - name: 移除 GCC 4.9 不认识的编译选项
-        working-directory: kernel
-        run: |
-          set -e
-          n=$(grep -rl "Wno-enum-conversion" . 2>/dev/null | wc -l)
-          echo "命中: $n"
-          [ "$n" -gt 0 ] && grep -rl "Wno-enum-conversion" . 2>/dev/null \
-            | xargs -r sed -i 's/-Wno-enum-conversion//g' || true
-          echo "[OK]"
-
-      - name: 移除 R17 无此硬件的 NXP 功放
-        working-directory: kernel
-        run: |
-          set -e
-          grep -rni "tfa98" techpack/ --include=Makefile --include=Kbuild || echo "(未引用)"
-          find techpack \( -name 'Makefile' -o -name 'Kbuild' \) \
-            -exec sed -i '/tfa98/Id' {} + 2>/dev/null || true
-          for m in $(find techpack -path '*tfa98xx*' -name 'Makefile'); do
-            : > "$m"; echo "[+] 清空 $m"
-          done
-          grep -rni "tfa98" techpack/ --include=Makefile --include=Kbuild || echo "(已清空)"
+          python3 self/ci/scripts/fix_tree.py kernel
 
       - name: 解析依赖
         working-directory: kernel
